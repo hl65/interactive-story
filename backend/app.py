@@ -4,21 +4,12 @@ import httpx
 import requests
 import json
 import random
-import os
+import os  # 新增导入 os 模块
 import sys
 from queue import Queue
 import asyncio
 import re
 from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
-
-# OpenAI API Key
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY or OPENAI_API_KEY == "<token>":
-    print("错误: OPENAI_API_KEY 环境变量未设置或未正确配置。请设置 OPENAI_API_KEY 环境变量！")
-    sys.exit(1)
 
 app = Flask(__name__, static_folder="../frontend", static_url_path="")
 
@@ -29,9 +20,24 @@ sessions = {}
 debug_queue = Queue()
 
 def debug_log(message, msg_type="log"):
+    """
+    将调试日志消息以 JSON 格式添加到调试队列中。
+
+    此函数接收一个消息和可选的消息类型，将它们组合成一个 JSON 对象，
+    并将其放入全局的调试队列中，以便后续处理和发送到前端。
+
+    参数:
+    message (str): 要记录的调试消息内容。
+    msg_type (str, 可选): 调试消息的类型，默认为 "log"。
+
+    返回:
+    None
+    """
     # 以 JSON 格式发送调试日志，包含日志类型和内容
     payload = json.dumps({"type": msg_type, "log": message})
+    # 将格式化后的日志消息放入调试队列
     debug_queue.put(payload)
+
 
 # SSE 调试日志流，实时推送 debug 消息到前端
 @app.route("/debug_stream")
@@ -42,24 +48,94 @@ def debug_stream():
             message = debug_queue.get()
             yield f"data: {message}\n\n"
     return Response(event_stream(), mimetype="text/event-stream")
-
 # 配置 API Token 和各 API URL
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
-if not SILICONFLOW_API_KEY or SILICONFLOW_API_KEY == "<token>":
-    print("错误: SILICONFLOW_API_KEY 环境变量未设置或未正确配置。请设置 SILICONFLOW_API_KEY 环境变量！")
-    sys.exit(1)
 
-## 引入官方 DeepSeek R1 API 的密钥
+load_dotenv()
+API_TOKEN = os.getenv("API_TOKEN")#还是这个好用
+API_TOKEN = os.environ.get("API_TOKEN")
+if not API_TOKEN or API_TOKEN == "<token>":
+    print("错误: API_TOKEN 环境变量未设置或未正确配置。请设置 API_TOKEN 环境变量！")
+    # 提供默认值或采取其他措施
+    API_TOKEN = "default_api_token"
+
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "<token>":
     print("错误: DEEPSEEK_API_KEY 环境变量未设置或未正确配置。请设置 DEEPSEEK_API_KEY 环境变量！")
-    sys.exit(1)
+    # 提供默认值或采取其他措施
+    DEEPSEEK_API_KEY = "default_deepseek_api_key"
 
+TRANSCRIPTION_URL = "https://api.siliconflow.cn/v1/audio/transcriptions"
 TRANSCRIPTION_URL = "https://api.siliconflow.cn/v1/audio/transcriptions"
 TTS_URL = "https://api.siliconflow.cn/v1/audio/speech"
 IMAGE_GEN_URL = "https://api.siliconflow.cn/v1/images/generations"
 TEXT_GEN_URL = "https://api.siliconflow.cn/v1/chat/completions"
 
+# 修改 try_provider_http_stream 函数以处理无效令牌错误
+async def try_provider_http_stream(api_url, payload, headers):
+    """Stream version that yields tokens"""
+    final_result = ""
+    accumulated_intermediate = ""
+    first_chunk_received = False
+    start_time = asyncio.get_running_loop().time()
+    first_token_time = None
+    token_count = 0
+
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", api_url, json=payload, headers=headers) as response:
+            debug_log("HTTP响应状态码: " + str(response.status_code) + " " + api_url)
+            if response.status_code == 401:
+                raise Exception("无效的 API 令牌")
+            if response.status_code == 400:
+                error_body = await response.aread()
+                raise Exception("HTTP 400: " + error_body.decode())
+            async for chunk in response.aiter_text():
+                if not first_chunk_received:
+                    elapsed = asyncio.get_running_loop().time() - start_time
+                    if elapsed > 10:
+                        raise TimeoutError("TTFT > 10 seconds")
+                    first_chunk_received = True
+                if not chunk:
+                    continue
+                for line in chunk.splitlines():
+                    line = line.strip()
+                    if line.startswith("data:"):
+                        line = line[len("data:"):].strip()
+                    if not line or line == "[DONE]" or "keep-alive" in line.lower():
+                        continue
+                    try:
+                        delta = robust_json_parse(line)
+                        for choice in delta.get("choices", []):
+                            message_delta = choice.get("delta", {})
+                            if message_delta.get("reasoning_content"):
+                                accumulated_intermediate += message_delta["reasoning_content"]
+                                debug_log(accumulated_intermediate, "intermediate")
+                            if message_delta.get("content"):
+                                token = message_delta["content"]
+                                final_result += token
+                                token_count += 1
+
+                                # Record first token time and TTFT
+                                if first_token_time is None:
+                                    first_token_time = asyncio.get_running_loop().time()
+                                    ttft = first_token_time - start_time
+                                    debug_log(f"TTFT: {ttft:.3f}s", "log")
+
+                                debug_log(final_result, "answer")
+                                yield token
+                    except Exception as e:
+                        debug_log("Error parsing delta: " + str(e) + ". Full response: " + line)
+
+    # Calculate and log metrics
+    end_time = asyncio.get_running_loop().time()
+    total_latency = end_time - start_time
+    if first_token_time and token_count > 0:
+        tpot = (end_time - first_token_time) / token_count
+        debug_log(
+            f"Metrics - Total tokens: {token_count}, TPOT: {tpot:.3f}s/token, Total latency: {total_latency:.3f}s", 
+            "log"
+        )
+    else:
+        debug_log(f"Metrics - Total latency: {total_latency:.3f}s", "log")
 # 新增 robust_json_parse 用于健壮解析 JSON 字符串
 def robust_json_parse(text):
     try:
@@ -97,26 +173,9 @@ stories_path = os.path.join(os.path.dirname(__file__), "stories.json")
 with open(stories_path, "r", encoding="utf-8") as f:
     stories_data = json.load(f)
 
-async def generate_text_async_stream(prompt, model=None):
+async def generate_text_async_stream(prompt, model):
     """Streaming version that yields tokens"""
-    if not model:
-        model = "openai/o3-mini"  # Default to OpenAI o3-mini
-        
-    if model.startswith("openai/"):
-        payload = {
-            "model": model.replace("openai/", ""),
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-            "max_tokens": 4096,
-        }
-        headers = {
-            "Authorization": "Bearer " + OPENAI_API_KEY,
-            "Content-Type": "application/json"
-        }
-        async for token in try_provider_http_stream("https://api.openai.com/v1/chat/completions", payload, headers):
-            yield token
-        return
-    elif model == "deepseek-ai/DeepSeek-R1":
+    if model == "deepseek-ai/DeepSeek-R1":
         providers = ["doubao", "siliconflow", "deepseek_official"]
         last_exception = None
         for provider in providers:
@@ -133,7 +192,7 @@ async def generate_text_async_stream(prompt, model=None):
                         "max_tokens": 8192,
                     }
                     headers = {
-                        "Authorization": "Bearer " + SILICONFLOW_API_KEY,
+                        "Authorization": "Bearer " + API_TOKEN,
                         "Content-Type": "application/json"
                     }
                     async for token in try_provider_http_stream(TEXT_GEN_URL, payload, headers):
@@ -172,7 +231,7 @@ async def generate_text_async_stream(prompt, model=None):
                 "max_tokens": 4096,
             }
             headers = {
-                "Authorization": "Bearer " + SILICONFLOW_API_KEY,
+                "Authorization": "Bearer " + API_TOKEN,
                 "Content-Type": "application/json"
             }
             async for token in try_provider_http_stream(TEXT_GEN_URL, payload, headers):
@@ -189,7 +248,7 @@ async def generate_text_async(prompt, model):
 
 def generate_text(prompt, model=None):
     if model is None:
-        model = "openai/o3-mini"  # Default to OpenAI o3-mini
+        model = "deepseek-ai/DeepSeek-V3"
     return asyncio.run(generate_text_async(prompt, model))
 
 async def try_provider_http_stream(api_url, payload, headers):
@@ -293,47 +352,93 @@ def generate_image(prompt):
     调用图片生成 API，根据生成响应提取第一张图片的 URL。
     """
     payload = {
-         "model": "deepseek-ai/Janus-Pro-7B",
+         "model": "stability-ai/stable-diffusion-xl-base-1.0",  # 更改为更稳定的模型
          "prompt": prompt,
+         "n": 1,  # 只生成一张图片
+         "size": "1024x1024",  # 指定图片尺寸
          "seed": random.randint(0, 9999999999)
     }
     headers = {
-         "Authorization": "Bearer " + SILICONFLOW_API_KEY,
+         "Authorization": f"Bearer {API_TOKEN}",
          "Content-Type": "application/json"
     }
-    response = requests.post(IMAGE_GEN_URL, json=payload, headers=headers)
-    if response.status_code == 200:
-         result = response.json()
-         images = result.get("images", [])
-         if images and isinstance(images, list) and images[0].get("url"):
-              return images[0]["url"]
-         else:
-              return "暂无图片"
-    else:
-         return "暂无图片"
-
+    
+    try:
+        debug_log(f"正在生成图片，prompt: {prompt}")
+        response = requests.post(IMAGE_GEN_URL, json=payload, headers=headers, timeout=30)
+        debug_log(f"图片生成API响应状态码: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            debug_log(f"图片生成API响应: {result}")
+            if "data" in result and len(result["data"]) > 0:
+                image_url = result["data"][0].get("url")
+                if image_url:
+                    debug_log(f"生成的图片URL: {image_url}")
+                    return image_url
+        
+        debug_log(f"图片生成失败，API返回: {response.text}")
+        return "https://placehold.co/600x400?text=Image+Generation+Failed"  # 使用占位图
+        
+    except Exception as e:
+        debug_log(f"图片生成过程出错: {str(e)}")
+        return "https://placehold.co/600x400?text=Error+Generating+Image"  # 使用占位图
 
 def text_to_speech(text, voice="fishaudio/fish-speech-1.5:alex"):
+    """
+    调用语音合成 API 将文本转换为语音。
+    返回完整的音频 URL。
+    """
     payload = {
         "model": "fishaudio/fish-speech-1.5",
         "input": text,
         "voice": voice,
         "response_format": "mp3",
         "sample_rate": 32000,
-        "stream": True,
+        "stream": False,
         "speed": 1,
         "gain": 0
     }
     headers = {
-        "Authorization": "Bearer " + SILICONFLOW_API_KEY,
+        "Authorization": "Bearer " + API_TOKEN,
         "Content-Type": "application/json"
     }
     try:
+        debug_log(f"正在调用 TTS API，文本内容: {text[:50]}...")
         response = requests.post(TTS_URL, json=payload, headers=headers)
-        response.raise_for_status()
-        return response.text
+        debug_log(f"TTS API 响应状态码: {response.status_code}")
+        
+        if response.status_code != 200:
+            debug_log(f"TTS API 错误响应: {response.text}")
+            return "语音输出失败"
+            
+        # 检查响应头的内容类型
+        content_type = response.headers.get('content-type', '')
+        debug_log(f"TTS API 响应内容类型: {content_type}")
+        
+        if 'application/json' in content_type:
+            try:
+                result = response.json()
+                if "url" in result:
+                    debug_log(f"获取到音频 URL: {result['url']}")
+                    return result["url"]
+            except Exception as e:
+                debug_log(f"解析 JSON 响应失败: {str(e)}")
+        
+        # 如果直接返回音频数据
+        if 'audio' in content_type or 'audio/mpeg' in content_type:
+            debug_log("收到直接的音频数据响应")
+            # 将音频数据转换为 base64
+            import base64
+            audio_base64 = base64.b64encode(response.content).decode('utf-8')
+            return f"data:audio/mp3;base64,{audio_base64}"
+            
+        debug_log(f"未知的响应格式: {response.text[:100]}")
+        return "语音输出失败"
+        
     except Exception as e:
-        print("文字转语音 API 调用失败：", e)
+        debug_log(f"文字转语音 API 调用失败：{str(e)}")
+        print(f"文字转语音 API 调用失败：{str(e)}")
         return "语音输出失败"
 
 
@@ -343,7 +448,7 @@ def transcribe_audio(file_path):
         'model': (None, 'FunAudioLLM/SenseVoiceSmall')
     }
     headers = {
-        "Authorization": "Bearer " + SILICONFLOW_API_KEY
+        "Authorization": "Bearer " + API_TOKEN
     }
     try:
         response = requests.post(TRANSCRIPTION_URL, files=files, headers=headers)
@@ -413,13 +518,18 @@ def generate_levels(chapter_text, extracted_info=None):
          characters_info = "角色信息：" + json.dumps(extracted_info.get("characters"), ensure_ascii=False) + "\n"
 
     prompt = (
-        "请根据下面的章节内容以及提供的角色信息设计出若干个关卡，每个关卡包含关卡描述和通关条件，每个关卡都用一段话描述。"
+        "请根据下面的章节内容以及提供的角色信息设计出若干个关卡，每个关卡包含关卡描述、通关条件和引导性的提示问题。"
         "请严格以 JSON 数组格式返回，不包含任何额外的说明文字。数组中的每个元素应为一个对象，格式为 "
-        "{\"level\": <数字>, \"description\": \"关卡剧情描述\", \"pass_condition\": \"通关条件描述\"}。\n" +
+        "{\"level\": <数字>, \"description\": \"关卡剧情描述\", \"pass_condition\": \"通关条件描述\", "
+        "\"hints\": [\"提示问题1?\", \"提示问题2?\", \"提示问题3?\"]}。\n" +
+        "提示问题必须以问号结尾,且必须引导玩家思考如何通过关卡。每个关卡生成3-5个提示问题。\n" +
         characters_info +
         "章节内容：\n" + chapter_text
     )
+    
+    # 调用 generate_text 获取结果
     result = generate_text(prompt, model="deepseek-ai/DeepSeek-R1")
+    
     try:
         levels = robust_json_parse(result["content"])
         if not isinstance(levels, list):
@@ -451,7 +561,7 @@ def evaluate_level(pass_condition, user_response, chat_history, overall_plot):
         f"用户回答：{user_response}\n"
         f"整体剧情：{overall_plot}\n"
         f"聊天记录：{chat_history}\n"
-        "请仔细分析用户回答是否确实完成了通关条件要求的任务。如果用户回答过于简单或模糊，不能明确判断是否完成任务，则应该判定为未通过。\n"
+        "请仔细分析用户回答是否确实完成了通关条件要求的任务。如果用户回答过于简单或模糊，不能明确判断是否完成任务，则应该判定为未通过。如果用户的故事足够精彩，逻辑合理，即可判定为通过，不要过分追求某些细节。如果用户在尝试5次以上依然无法通关，就直接跳到下一关\n"
         "请直接回复\"通过\"或\"未通过\"，不要包含其他内容。"
     )
     result = generate_text(prompt)
@@ -555,6 +665,7 @@ def get_level():
                     "level_number": level.get("level"),
                     "description": level.get("description"),
                     "pass_condition": level.get("pass_condition"),
+                    "hints": level.get("hints", []),  # 添加hints字段
                     "level_image": level["level_image"],
                     "ai_role": ai_role,
                     "game_over": False
@@ -590,6 +701,7 @@ def get_level():
         "level_number": level.get("level"),
         "description": level.get("description"),
         "pass_condition": level.get("pass_condition"),
+        "hints": level.get("hints", []),  # 添加hints字段
         "level_image": level["level_image"],
         "ai_role": ai_role,
         "game_over": False
@@ -756,6 +868,36 @@ def update_chat_history():
     
     return jsonify({"message": "聊天历史更新成功"})
 
+@app.route("/transcribe_audio", methods=["POST"])
+def handle_transcribe():
+    if "file" not in request.files:
+        return "No file uploaded", 400
+        
+    file = request.files["file"]
+    if file.filename == "":
+        return "No file selected", 400
+        
+    # 保存临时文件
+    temp_path = "temp_audio.wav"
+    file.save(temp_path)
+    
+    try:
+        transcribed_text = transcribe_audio(temp_path)
+        return transcribed_text
+    finally:
+        # 删除临时文件
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+@app.route("/text_to_speech", methods=["POST"])
+def handle_tts():
+    data = request.get_json()
+    text = data.get("text", "")
+    if not text:
+        return "No text provided", 400
+        
+    audio_url = text_to_speech(text)
+    return audio_url
 
 if __name__ == "__main__":
     app.run(debug=True, port=8888, threaded=True)
